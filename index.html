@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PDF 기울기 보정</title>
+<style>
+:root{color-scheme:light dark;font-family:system-ui,sans-serif}
+body{max-width:560px;margin:3rem auto;padding:0 16px}
+#drop{border:2px dashed #888;border-radius:12px;padding:2.5rem 1rem;text-align:center;cursor:pointer}
+#drop.over{background:#8883}
+progress{width:100%;margin-top:1rem}
+#out a{display:inline-block;margin:.5rem .5rem 0 0;padding:.5rem 1rem;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none}
+small{opacity:.7}
+</style>
+</head>
+<body>
+<h1>PDF 기울기 보정</h1>
+<label id="drop">PDF를 끌어놓거나 클릭해서 선택<input id="file" type="file" accept="application/pdf" hidden></label>
+<progress id="bar" value="0" max="1" hidden></progress>
+<p id="msg"></p>
+<div id="out"></div>
+<small>파일은 서버로 전송되지 않고 이 브라우저 안에서만 처리됩니다. 이미지·OCR 텍스트는 재인코딩하지 않고 페이지만 회전합니다.
+500MB 이상은 데스크톱 Chrome을 권장하고 다른 탭은 닫아주세요.</small>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const DPI = 100, MAX_DEG = 7, MIN_DEG = 0.1, MAX_PTS = 30000;
+
+// 검출 각도 = 이미지를 반시계로 돌려 줄을 수평으로 만드는 각도(deskew 라이브러리·pypdf rotate와 같은 부호).
+// ponytail: 투영 프로파일 방식, 사진·큰 도형이 많은 페이지는 부정확. 필요하면 Hough로 교체.
+function detectAngle(rgba, w, h) {
+  const n = w * h, g = new Uint8Array(n), hist = new Array(256).fill(0);
+  for (let i = 0; i < n; i++) {
+    const v = (rgba[4 * i] * 77 + rgba[4 * i + 1] * 150 + rgba[4 * i + 2] * 29) >> 8;
+    g[i] = v; hist[v]++;
+  }
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let wB = 0, sB = 0, best = 0, t = 128;               // Otsu 임계값
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; const wF = n - wB;
+    if (!wB) continue; if (!wF) break;
+    sB += i * hist[i];
+    const d = sB / wB - (sum - sB) / wF, v = wB * wF * d * d;
+    if (v > best) { best = v; t = i; }
+  }
+  let dark = 0; for (let i = 0; i <= t; i++) dark += hist[i];
+  if (dark < 300) return 0;
+  const step = Math.max(1, Math.round(dark / MAX_PTS)), xs = [], ys = [];
+  for (let i = 0, k = 0; i < n; i++) if (g[i] <= t && k++ % step === 0) { xs.push(i % w); ys.push((i / w) | 0); }
+
+  const off = Math.ceil(w * 0.15), bins = new Float64Array(h + 2 * off + 2);
+  const score = deg => {
+    const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
+    bins.fill(0);
+    for (let i = 0; i < xs.length; i++) bins[Math.round(-xs[i] * s + ys[i] * c) + off]++;
+    let sc = 0; for (let i = 1; i < bins.length; i++) sc += (bins[i] - bins[i - 1]) ** 2;
+    return sc;
+  };
+  const search = (lo, hi, st) => {
+    let bd = 0, bs = -1;
+    for (let d = lo; d <= hi + 1e-9; d += st) { const s = score(d); if (s > bs) { bs = s; bd = d; } }
+    return bd;
+  };
+  const coarse = search(-MAX_DEG, MAX_DEG, 0.5), a = search(coarse - 0.5, coarse + 0.5, 0.05);
+  return Math.abs(a) < MIN_DEG ? 0 : a;
+}
+
+// 콘텐츠 스트림 앞뒤를 q <회전 cm> … Q 로 감싸고 MediaBox/CropBox를 회전 후 외접 사각형으로 확장.
+function rotatePage(doc, page, deg) {
+  const r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r), f = v => v.toFixed(6);
+  const { x, y, width: w, height: h } = page.getMediaBox();
+  const cx = x + w / 2, cy = y + h / 2;
+  const W = Math.abs(w * c) + Math.abs(h * s), H = Math.abs(w * s) + Math.abs(h * c);
+  const ctx = doc.context;
+  page.node.normalize();
+  page.node.wrapContentStreams(
+    ctx.register(ctx.stream(`q ${f(c)} ${f(s)} ${f(-s)} ${f(c)} ${f(cx - cx * c + cy * s)} ${f(cy - cx * s - cy * c)} cm\n`)),
+    ctx.register(ctx.stream("\nQ")));
+  page.setMediaBox(cx - W / 2, cy - H / 2, W, H);
+  page.setCropBox(cx - W / 2, cy - H / 2, W, H);
+}
+
+async function run(file, onProgress) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)) }).promise;
+  const canvas = document.createElement("canvas"), cx = canvas.getContext("2d", { willReadFrequently: true });
+  const angles = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p), vp = page.getViewport({ scale: DPI / 72 });
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    cx.fillStyle = "#fff"; cx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: cx, viewport: vp }).promise;
+    angles.push(detectAngle(cx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height));
+    page.cleanup();
+    onProgress("각도 검출", p, pdf.numPages);
+  }
+  await pdf.destroy();
+
+  onProgress("PDF 읽는 중", 0, 1);
+  const doc = await PDFLib.PDFDocument.load(buf, { updateMetadata: false });
+  const pages = doc.getPages();
+  pages.forEach((pg, i) => { if (angles[i]) rotatePage(doc, pg, angles[i]); });
+  onProgress("저장 중", 0, 1);
+  const bytes = await doc.save();
+  const csv = "page,angle_deg\n" + angles.map((a, i) => `${i + 1},${a.toFixed(3)}`).join("\n") + "\n";
+  return { bytes, csv, angles };
+}
+
+const $ = id => document.getElementById(id);
+const link = (blob, name, label) => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name; a.textContent = label;
+  $("out").append(a);
+};
+async function handle(file) {
+  if (!file) return;
+  $("out").textContent = ""; $("bar").hidden = false;
+  try {
+    const { bytes, csv, angles } = await run(file, (label, i, n) => {
+      $("bar").max = n; $("bar").value = i; $("msg").textContent = `${label} ${i}/${n}`;
+    });
+    const base = file.name.replace(/\.pdf$/i, "");
+    $("msg").textContent = `완료: ${angles.length}쪽 중 ${angles.filter(Boolean).length}쪽 보정`;
+    link(new Blob([bytes], { type: "application/pdf" }), `${base}_보정본.pdf`, "보정본 PDF 받기");
+    link(new Blob([csv], { type: "text/csv" }), `${base}_각도.csv`, "각도 CSV 받기");
+  } catch (e) {
+    $("msg").textContent = "실패: " + e.message;
+  }
+  $("bar").hidden = true;
+}
+$("file").onchange = e => handle(e.target.files[0]);
+$("drop").ondragover = e => { e.preventDefault(); $("drop").classList.add("over"); };
+$("drop").ondragleave = () => $("drop").classList.remove("over");
+$("drop").ondrop = e => { e.preventDefault(); $("drop").classList.remove("over"); handle(e.dataTransfer.files[0]); };
+</script>
+</body>
+</html>
