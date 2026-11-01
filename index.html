@@ -13,7 +13,8 @@ progress{width:100%;margin-top:1rem}
 #out a{display:inline-block;margin:.5rem .5rem 0 0;padding:.5rem 1rem;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none}
 #out{margin-bottom:1.5rem}
 #out details{margin-top:1rem}
-#out details div{max-height:12rem;overflow:auto;margin-top:.5rem;line-height:1.6}
+#out details div{max-height:20rem;overflow:auto;margin-top:.5rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(8.5rem,1fr));gap:.25rem;font-size:.9rem;font-variant-numeric:tabular-nums}
+#out details div span{display:flex;justify-content:space-between;padding:.2rem .5rem;border-radius:6px;background:#8882}
 small{opacity:.7}
 </style>
 </head>
@@ -129,11 +130,15 @@ async function handle(file) {
     $("msg").textContent = `완료: ${angles.length}쪽 중 ${angles.filter(Boolean).length}쪽 보정`;
     link(new Blob([bytes], { type: "application/pdf" }), `${base}_보정본.pdf`, "보정본 PDF 받기");
     link(new Blob([csv], { type: "text/csv" }), `${base}_각도.csv`, "각도 CSV 받기");
-    const fixed = angles.map((a, i) => a && `${i + 1}쪽 ${a > 0 ? "+" : ""}${a.toFixed(2)}°`).filter(Boolean);
+    const fixed = angles.map((a, i) => [i + 1, a]).filter(([, a]) => a);
     if (fixed.length) {
       const d = document.createElement("details"), s = document.createElement("summary"), b = document.createElement("div");
       s.textContent = `보정된 페이지 ${fixed.length}쪽 (+는 반시계 방향 회전)`;
-      b.textContent = fixed.join(" · ");
+      b.append(...fixed.map(([p, a]) => {
+        const el = document.createElement("span"), pg = document.createElement("b"), ag = document.createElement("i");
+        pg.textContent = `${p}쪽`; ag.textContent = `${a > 0 ? "+" : ""}${a.toFixed(2)}°`; ag.style.opacity = .75;
+        el.append(pg, ag); return el;
+      }));
       d.append(s, b); $("out").append(d);
     }
   } catch (e) {
